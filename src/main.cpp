@@ -1,36 +1,57 @@
 #include <Arduino.h>
+#include "esp_sleep.h"
 
 // ---------- pins ----------
-const int SOIL_PIN = 34; // sensor A0
-const int SOIL_PWR = 25; // sensor VCC (on only while reading)
-const int PUMP_PIN = 26; // MOSFET gate
+const int SOIL_PIN = 34;
+const int SOIL_PWR = 25;
+const int PUMP_PIN = 26;
+const int VBAT_PIN = 35;
+const int CLEAR_PIN = 27; // button to GND: hold at wake/boot to clear fault
 
-// ---------- calibration (measured) ----------
-const int DRY_RAW = 4095;
-const int WET_RAW = 535;
+// ---------- thresholds: PROVISIONAL ----------
+const int START_RAW = 3000; // irrigate when raw >= this
+const int STOP_RAW = 1000;  // stop when raw <= this
 
-// ---------- irrigation thresholds: PROVISIONAL ----------
-const int START_RAW = 3000; // irrigate when raw >= this (dry side)
-const int STOP_RAW = 1000;  // stop when raw <= this (wet side)
+// ---------- sleep ----------
+const uint64_t SLEEP_INTERVAL_S = 30; // demo: 30 s. final: 15*60
+const int WAKES_PER_DAY = 2880;       // 86400 / SLEEP_INTERVAL_S (final: 96)
 
-// ---------- timing (short values for testing) ----------
-const unsigned long CHECK_INTERVAL_MS = 10000; // final: 15 min
-const unsigned long PUMP_ON_MS = 5000;         // one pulse
-const unsigned long SOAK_MS = 30000;           // wait after pulse; final: 3-5 min
+// ---------- battery policy (off while powered from USB) ----------
+const bool USE_BATTERY_POLICY = false;
+const float BAT_RATIO = 2.0f;
+const float BAT_MIN_RUN = 3.2f;
+const float BAT_MIN_IRRIGATE = 3.4f;
+
+// ---------- irrigation timing ----------
+const unsigned long PUMP_ON_MS = 5000;
+const unsigned long SOAK_MS = 30000; // final: 60-120 s
+const unsigned long CONFIRM_GAP_MS = 1000;
 
 // ---------- safety limits ----------
-const int CONFIRM_READS = 3; // consecutive dry reads needed
+const int CONFIRM_READS = 3;
 const int MAX_PULSES_PER_CYCLE = 6;
 const unsigned long MAX_PUMP_MS_PER_DAY = 60000;
-const int MIN_CHANGE = 100;      // raw must drop at least this after a pulse
-const int NO_RESPONSE_LIMIT = 3; // pulses with no change before a fault
+const int MIN_CHANGE = 100;
+const int NO_RESPONSE_LIMIT = 3;
 
-// ---------- state ----------
-unsigned long pumpMsToday = 0;
-unsigned long dayStartMs = 0;
-bool faultLocked = false;
+// ---------- state kept through deep sleep (RTC memory) ----------
+RTC_DATA_ATTR unsigned long rtcPumpMsToday = 0;
+RTC_DATA_ATTR int rtcWakeCount = 0;
+RTC_DATA_ATTR bool rtcFault = false;
 
 const int SAMPLES = 15;
+
+void sortArr(int *v, int n)
+{
+  for (int i = 0; i < n - 1; i++)
+    for (int j = i + 1; j < n; j++)
+      if (v[j] < v[i])
+      {
+        int t = v[i];
+        v[i] = v[j];
+        v[j] = t;
+      }
+}
 
 int readSoilRaw()
 {
@@ -43,16 +64,20 @@ int readSoilRaw()
     delay(5);
   }
   digitalWrite(SOIL_PWR, LOW);
+  sortArr(v, SAMPLES);
+  return v[SAMPLES / 2];
+}
 
-  for (int i = 0; i < SAMPLES - 1; i++)
-    for (int j = i + 1; j < SAMPLES; j++)
-      if (v[j] < v[i])
-      {
-        int t = v[i];
-        v[i] = v[j];
-        v[j] = t;
-      }
-  return v[SAMPLES / 2]; // median
+float readVbat()
+{
+  int v[SAMPLES];
+  for (int i = 0; i < SAMPLES; i++)
+  {
+    v[i] = analogReadMilliVolts(VBAT_PIN);
+    delay(5);
+  }
+  sortArr(v, SAMPLES);
+  return v[SAMPLES / 2] / 1000.0f * BAT_RATIO;
 }
 
 void runPump(unsigned long ms)
@@ -61,18 +86,19 @@ void runPump(unsigned long ms)
   digitalWrite(PUMP_PIN, HIGH);
   delay(ms);
   digitalWrite(PUMP_PIN, LOW);
-  pumpMsToday += ms;
+  rtcPumpMsToday += ms;
   Serial.println("  pump OFF");
 }
 
-// true only if several reads in a row are all on the dry side
 bool confirmedDry()
 {
   for (int i = 0; i < CONFIRM_READS; i++)
   {
-    if (readSoilRaw() < START_RAW)
+    int r = readSoilRaw();
+    Serial.printf("  confirm read %d: %d\n", i + 1, r);
+    if (r < START_RAW)
       return false;
-    delay(1000);
+    delay(CONFIRM_GAP_MS);
   }
   return true;
 }
@@ -80,37 +106,37 @@ bool confirmedDry()
 void irrigate()
 {
   int noResponse = 0;
-  Serial.println("irrigation cycle started");
+  Serial.println("[irr] cycle started");
 
   for (int pulse = 1; pulse <= MAX_PULSES_PER_CYCLE; pulse++)
   {
-    if (pumpMsToday + PUMP_ON_MS > MAX_PUMP_MS_PER_DAY)
+    if (rtcPumpMsToday + PUMP_ON_MS > MAX_PUMP_MS_PER_DAY)
     {
-      Serial.println("daily pump limit reached, stopping");
+      Serial.println("[irr] daily pump limit reached, stopping");
       return;
     }
-
     int before = readSoilRaw();
-    Serial.printf("pulse %d: raw before = %d\n", pulse, before);
+    Serial.printf("[irr] pulse %d: raw before = %d\n", pulse, before);
+
     runPump(PUMP_ON_MS);
-    delay(SOAK_MS); // let the water soak in
+    delay(SOAK_MS);
+
     int after = readSoilRaw();
-    Serial.printf("  raw after = %d\n", after);
+    Serial.printf("[irr]   raw after = %d\n", after);
 
     if (after <= STOP_RAW)
     {
-      Serial.println("soil is wet enough, cycle done");
+      Serial.println("[irr] soil wet enough, cycle done");
       return;
     }
-
     if (after > before - MIN_CHANGE)
-    { // reading barely changed
+    {
       noResponse++;
-      Serial.printf("  no response (%d/%d)\n", noResponse, NO_RESPONSE_LIMIT);
+      Serial.printf("[irr]   no response (%d/%d)\n", noResponse, NO_RESPONSE_LIMIT);
       if (noResponse >= NO_RESPONSE_LIMIT)
       {
-        faultLocked = true;
-        Serial.println("FAULT: soil reading does not respond. Irrigation disabled.");
+        rtcFault = true;
+        Serial.println("[irr] FAULT: soil reading does not respond. Irrigation disabled.");
         return;
       }
     }
@@ -119,45 +145,89 @@ void irrigate()
       noResponse = 0;
     }
   }
-  Serial.println("max pulses per cycle reached, stopping");
+  Serial.println("[irr] max pulses per cycle reached, stopping");
+}
+
+void goToSleep()
+{
+  digitalWrite(PUMP_PIN, LOW);
+  digitalWrite(SOIL_PWR, LOW);
+  Serial.printf("sleeping %llu s (wake #%d, pumpToday=%lus, fault=%d)\n",
+                SLEEP_INTERVAL_S, rtcWakeCount, rtcPumpMsToday / 1000, rtcFault);
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_S * 1000000ULL);
+  esp_deep_sleep_start();
 }
 
 void setup()
 {
-  Serial.begin(115200);
   pinMode(PUMP_PIN, OUTPUT);
   digitalWrite(PUMP_PIN, LOW); // pump OFF first, always
   pinMode(SOIL_PWR, OUTPUT);
   digitalWrite(SOIL_PWR, LOW);
+
+  Serial.begin(115200);
+  delay(500);
   analogReadResolution(12);
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
-  dayStartMs = millis();
-  delay(2000);
-  Serial.println("irrigation logic started");
-}
+  analogSetPinAttenuation(VBAT_PIN, ADC_11db);
 
-void loop()
-{
-  if (faultLocked)
+  // clear-fault button: hold it while the board wakes/boots
+  pinMode(CLEAR_PIN, INPUT_PULLUP);
+  if (digitalRead(CLEAR_PIN) == LOW)
   {
-    Serial.println("FAULT: irrigation disabled (reset the board to retry)");
-    delay(10000);
-    return;
+    rtcFault = false;
+    rtcPumpMsToday = 0;
+    rtcWakeCount = 0;
+    Serial.println("*** fault cleared by button ***");
   }
 
-  // reset the daily pump counter every 24 hours
-  if (millis() - dayStartMs >= 86400000UL)
+  rtcWakeCount++;
+  if (rtcWakeCount >= WAKES_PER_DAY)
+  { // new day: reset the pump counter
+    rtcWakeCount = 0;
+    rtcPumpMsToday = 0;
+  }
+
+  Serial.printf("\n=== wake #%d, wake cause: %d ===\n",
+                rtcWakeCount, (int)esp_sleep_get_wakeup_cause());
+
+  if (rtcFault)
   {
-    dayStartMs = millis();
-    pumpMsToday = 0;
+    Serial.println("FAULT flag set: irrigation disabled (hold button to clear)");
+    goToSleep();
+  }
+
+  if (USE_BATTERY_POLICY)
+  {
+    float vbat = readVbat();
+    Serial.printf("Vbat=%.2f V\n", vbat);
+    if (vbat < BAT_MIN_RUN)
+    {
+      Serial.println("battery too low, sleeping");
+      goToSleep();
+    }
   }
 
   int raw = readSoilRaw();
-  Serial.printf("t=%lus raw=%d pumpToday=%lus\n", millis() / 1000, raw, pumpMsToday / 1000);
+  Serial.printf("soil raw = %d\n", raw);
 
   if (raw >= START_RAW && confirmedDry())
   {
-    irrigate();
+    bool batOk = true;
+    if (USE_BATTERY_POLICY)
+      batOk = readVbat() >= BAT_MIN_IRRIGATE;
+    if (batOk)
+      irrigate();
+    else
+      Serial.println("battery too low to irrigate");
   }
-  delay(CHECK_INTERVAL_MS);
+  else
+  {
+    Serial.println("soil is OK, no irrigation");
+  }
+
+  goToSleep();
 }
+
+void loop() {}
